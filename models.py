@@ -2,6 +2,9 @@ from __future__ import print_function
 from __future__ import absolute_import
 from __future__ import division
 
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
 import sys
 import numpy as np
 import tensorflow as tf
@@ -9,10 +12,11 @@ import utils
 from time import time
 
 from sklearn.metrics import roc_auc_score
+from tensorflow.contrib.layers.python.layers import batch_norm as batch_norm
 
 class Model:
     def __init__(self, eval_metric, greater_is_better, 
-                 epoch, batch_size, verbose):
+                 epoch, batch_size, verbose, batch_norm=False, dropout_deep=[]):
         self.sess = None
         self.loss = None
         self.optimizer = None
@@ -23,6 +27,8 @@ class Model:
         self.greater_is_better = greater_is_better
         
         self.verbose = verbose    
+        self.batch_norm = batch_norm
+        self.dropout_deep = dropout_deep
 
         self.train_result, self.valid_result = [], []
 
@@ -31,6 +37,12 @@ class Model:
         end = (index+1) * batch_size
         end = end if end < len(y) else len(y)
         return Xi[start:end], Xv[start:end], [[y_] for y_ in y[start:end]]
+
+    def batch_norm_layer(self, x, train_phase, scope_bn):
+        bn_train = batch_norm(x, decay=0.995, is_training=True, updates_collections=None, reuse=None, scope=scope_bn)
+        bn_inference = batch_norm(x, decay=0.995, is_training=False, updates_collections=None, reuse=True, scope=scope_bn)
+        z = tf.cond(train_phase, lambda: bn_train, lambda: bn_inference)
+        return z
 
     # shuffle three lists simutaneously
     def shuffle_in_unison_scary(self, a, b, c):
@@ -43,9 +55,23 @@ class Model:
 
 
     def fit_on_batch(self, Xi, Xv, y):
-        feed_dict = {self.feat_index: Xi,
-                     self.feat_value: Xv,
-                     self.label: y}
+        if self.batch_norm:
+            if len(self.dropout_deep) == 0:
+                feed_dict = {self.feat_index: Xi,
+                             self.feat_value: Xv,
+                             self.label: y,
+                             self.train_phase: True}
+            else:
+                feed_dict = {self.feat_index: Xi,
+                             self.feat_value: Xv,
+                             self.label: y,
+                             self.train_phase: True,
+                             self.dropout_keep_deep: self.dropout_deep}
+        else:
+            feed_dict = {self.feat_index: Xi,
+                        self.feat_value: Xv,
+                        self.label: y}
+ 
         loss, opt = self.sess.run((self.loss, self.optimizer), feed_dict=feed_dict)
         return loss
 
@@ -148,9 +174,23 @@ class Model:
         y_pred = None
         while len(Xi_batch) > 0:
             num_batch = len(y_batch)
-            feed_dict = {self.feat_index: Xi_batch,
-                         self.feat_value: Xv_batch,
-                         self.label: y_batch}
+            if self.batch_norm:
+                if len(self.dropout_deep) == 0:
+                    feed_dict = {self.feat_index: Xi_batch,
+                                 self.feat_value: Xv_batch,
+                                 self.label: y_batch,
+                                 self.train_phase: False}
+                else:
+                    feed_dict = {self.feat_index: Xi_batch,
+                                 self.feat_value: Xv_batch,
+                                 self.label: y_batch,
+                                 self.dropout_keep_deep: len(self.dropout_deep) * [1],
+                                 self.train_phase: False}
+            else:
+                feed_dict = {self.feat_index: Xi_batch,
+                             self.feat_value: Xv_batch,
+                             self.label: y_batch}
+ 
             batch_out = self.sess.run(self.y_prob, feed_dict=feed_dict)
 
             if batch_index == 0:
@@ -178,8 +218,9 @@ class LR(Model):
     def __init__(self, feature_size, field_size, optimizer_type='gd', learning_rate=1e-2, l2_reg=0, verbose=False,
                  random_seed=None, eval_metric=roc_auc_score, greater_is_better=True, epoch=10, batch_size=1024):
         Model.__init__(self, eval_metric, greater_is_better, epoch, batch_size, verbose)
-        init_vars = [('w', [feature_size, 1], 'xavier', tf.float32),
+        init_vars = [('w', [feature_size, 1], 'zero', tf.float32),
                      ('b', [1], 'zero', tf.float32)]
+        
         self.graph = tf.Graph()
         with self.graph.as_default():
             if random_seed is not None:
@@ -212,4 +253,143 @@ class LR(Model):
             config.gpu_options.allow_growth = True
             self.sess = tf.Session(config=config)
             tf.global_variables_initializer().run(session=self.sess)
+
+class FM(Model):
+    def __init__(self, feature_size, field_size, embedding_size=8, optimizer_type='gd', learning_rate=1e-2, verbose=False,
+                 random_seed=None, eval_metric=roc_auc_score, greater_is_better=True, epoch=10, batch_size=1024, l2_w_reg=0, l2_v_reg=0):
+        Model.__init__(self, eval_metric, greater_is_better, epoch, batch_size, verbose)
+        init_vars = [('w', [feature_size, 1], 'normal', tf.float32),
+                     ('b', [1], 'zero', tf.float32),
+                     ('v', [feature_size, embedding_size], 'normal', tf.float32)]
+
+        self.graph = tf.Graph()
+        with self.graph.as_default():
+            if random_seed is not None:
+                tf.set_random_seed(random_seed)
+            
+            self.feat_index = tf.placeholder(tf.int32, shape=[None, None],
+                                                 name="feat_index")  # None * F
+            self.feat_value = tf.placeholder(tf.float32, shape=[None, None],
+                                                 name="feat_value")  # None * F
+            self.label = tf.placeholder(tf.float32, shape=[None, 1], name="label")  # None * 1
+
+            self.vars = utils.init_var_map(init_vars)
+
+            w = self.vars['w']
+            b = self.vars['b']
+            v = self.vars['v']
+            #first order
+            self.w_emb = tf.nn.embedding_lookup(w, self.feat_index)  # None * F * K
+            feat_value = tf.reshape(self.feat_value, shape=[-1, field_size, 1])
+            self.wx = tf.multiply(self.w_emb, feat_value) # None * F * 1
+            self.wx_sum = tf.reshape(tf.reduce_sum(self.wx, 1), shape=[-1, 1])
+ 
+            #second order
+            self.v_emb = tf.nn.embedding_lookup(v, self.feat_index)
+            self.vx = tf.multiply(self.v_emb, feat_value) # None * F * K 
+
+            self.squared_vx = tf.square(self.vx)
+            self.sum_squared_vx = tf.reduce_sum(self.squared_vx, 1)
+
+            self.sum_vx = tf.reduce_sum(self.vx, 1)
+            self.squared_sum_vx = tf.square(self.sum_vx)
+
+            self.fm_cross_term = tf.reshape(0.5 * tf.reduce_sum(
+                tf.subtract(self.squared_sum_vx, self.sum_squared_vx), 1),
+                [-1, 1]) # None * 1
+            
+            logits = self.wx_sum + self.fm_cross_term + b
+            self.y_prob = tf.sigmoid(logits)
+            
+            self.loss = tf.reduce_mean(
+                tf.nn.sigmoid_cross_entropy_with_logits(labels=self.label, logits=logits)) + \
+                        l2_w_reg * tf.nn.l2_loss(self.w_emb) + l2_v_reg * tf.nn.l2_loss(self.v_emb)
+            self.optimizer = utils.get_optimizer(optimizer_type, learning_rate, self.loss)
+
+            config = tf.ConfigProto()
+            config.gpu_options.allow_growth = True
+            self.sess = tf.Session(config=config)
+            tf.global_variables_initializer().run(session=self.sess)
+
+class DeepFM(Model):
+    def __init__(self, feature_size, field_size, embedding_size=8, optimizer_type='gd', learning_rate=1e-2, verbose=False,
+                 random_seed=None, eval_metric=roc_auc_score, greater_is_better=True, epoch=10, batch_size=1024, l2_reg=0, 
+                 deep_layers=[32, 32], batch_norm=True, dropout_deep=[]):
+        Model.__init__(self, eval_metric, greater_is_better, epoch, batch_size, verbose, batch_norm, dropout_deep)
+        init_vars = [('weight', [feature_size, 1], 'uniform', tf.float32),
+                     ('bias', [1], 'uniform', tf.float32),
+                     ('feature_embed', [feature_size, embedding_size], 'normal', tf.float32)]
+        node_in = embedding_size * field_size 
+        for i in range(len(deep_layers)):
+            init_vars.extend([('layer_%d' % i, [node_in, deep_layers[i]], 'glorot_normal', tf.float32)])
+            init_vars.extend([('bias_%d' % i, [1, deep_layers[i]], 'glorot_normal', tf.float32)])
+            node_in = deep_layers[i]
+
+        node_in = field_size + embedding_size + deep_layers[-1]
+        init_vars.extend([('concat_projection', [node_in, 1], 'glorot_normal', tf.float32)])
+        init_vars.extend([('concat_bias', [1, 1], 'glorot_normal', tf.float32)])
+        self.graph = tf.Graph()
+        with self.graph.as_default():
+            if random_seed is not None:
+                tf.set_random_seed(random_seed)
+            
+            self.feat_index = tf.placeholder(tf.int32, shape=[None, None],
+                                                 name="feat_index")  # None * F
+            self.feat_value = tf.placeholder(tf.float32, shape=[None, None],
+                                                 name="feat_value")  # None * F
+            self.label = tf.placeholder(tf.float32, shape=[None, 1], name="label")  # None * 1
+            self.dropout_keep_deep = tf.placeholder(tf.float32, shape=[None], name="dropout_keep_deep")
+            self.train_phase = tf.placeholder(tf.bool, name="train_phase")
+            
+            self.vars = utils.init_var_map(init_vars)
+
+            weight = self.vars['weight']
+            bias = self.vars['bias']
+            feature_embed = self.vars['feature_embed']
+            #first order
+            self.w_emb = tf.nn.embedding_lookup(weight, self.feat_index)  # None * F * K
+            feat_value = tf.reshape(self.feat_value, shape=[-1, field_size, 1])
+            self.wx = tf.reshape(tf.multiply(self.w_emb, feat_value), [-1, field_size]) # None * F
+                
+            #second order
+            self.v_emb = tf.nn.embedding_lookup(feature_embed, self.feat_index)
+            self.vx = tf.multiply(self.v_emb, feat_value) # None * F * K 
+
+            self.squared_vx = tf.square(self.vx)
+            self.sum_squared_vx = tf.reduce_sum(self.squared_vx, 1)
+
+            self.sum_vx = tf.reduce_sum(self.vx, 1)
+            self.squared_sum_vx = tf.square(self.sum_vx)
+
+            self.fm_cross_term = 0.5 * tf.subtract(self.squared_sum_vx, self.sum_squared_vx)
+            
+            self.y_deep = tf.reshape(self.vx, [-1, embedding_size * field_size])
+            self.y_deep = tf.nn.dropout(self.y_deep, self.dropout_keep_deep[0])
+            for i in range(len(deep_layers)):
+                self.y_deep = tf.add(
+                    tf.matmul(self.y_deep, self.vars['layer_%s' % i]), self.vars['bias_%s' % i])
+                if self.batch_norm:
+                    self.y_deep = self.batch_norm_layer(self.y_deep, train_phase=self.train_phase, scope_bn="bn_%s" % i)
+                self.y_deep = tf.nn.dropout(utils.activate(self.y_deep, 'relu'), self.dropout_keep_deep[i+1])
+
+            concat_projection = self.vars['concat_projection']
+            concat_bias = self.vars['concat_bias'] 
+
+            self.out = tf.concat([self.wx, self.fm_cross_term, self.y_deep], 1)
+            self.out = tf.matmul(self.out, concat_projection) #, concat_bias)
+            self.y_prob = tf.sigmoid(self.out)
+            
+            self.loss = tf.reduce_mean(
+                tf.nn.sigmoid_cross_entropy_with_logits(labels=self.label, logits=self.out)) + \
+                    tf.contrib.layers.l2_regularizer(
+                        l2_reg)(self.vars["concat_projection"])
+            for i in range(len(deep_layers)):
+                self.loss += tf.contrib.layers.l2_regularizer(
+                    l2_reg)(self.vars["layer_%d"%i])
+
+            self.optimizer = utils.get_optimizer(optimizer_type, learning_rate, self.loss)
+            config = tf.ConfigProto()
+            config.gpu_options.allow_growth = True
+            self.sess = tf.Session(config=config)
+            self.sess.run(tf.global_variables_initializer())
 

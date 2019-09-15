@@ -9,6 +9,9 @@ import os
 import json
 import sys 
 
+MINVAL = -1.
+MAXVAL = 1.
+STDDEV = 0.01
 def read_data(filename):
     fea_index = []
     fea_value = []
@@ -48,11 +51,16 @@ def init_var_map(init_vars, init_path=None):
         elif init_method == 'uniform':
             var_map[var_name] = tf.Variable(tf.random_uniform(var_shape, minval=MINVAL, maxval=MAXVAL, dtype=dtype),
                                             name=var_name, dtype=dtype)
-        elif init_method == 'xavier':
+        elif init_method == 'glorot_uniform':
             maxval = np.sqrt(6. / np.sum(var_shape))
             minval = -maxval
             var_map[var_name] = tf.Variable(tf.random_uniform(var_shape, minval=minval, maxval=maxval, dtype=dtype),
                                             name=var_name, dtype=dtype)
+        elif init_method == 'glorot_normal':
+            maxval = np.sqrt(2. / np.sum(var_shape))
+            var_map[var_name] = tf.Variable(tf.random_normal(var_shape, mean=0, stddev=maxval, dtype=dtype),
+                                            name=var_name, dtype=dtype)
+            
         elif isinstance(init_method, int) or isinstance(init_method, float):
             var_map[var_name] = tf.Variable(tf.ones(var_shape, dtype=dtype) * init_method, name=var_name, dtype=dtype)
         elif init_method in load_var_map:
