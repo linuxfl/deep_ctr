@@ -393,3 +393,89 @@ class DeepFM(Model):
             self.sess = tf.Session(config=config)
             self.sess.run(tf.global_variables_initializer())
 
+class PNN(Model):
+    def __init__(self, feature_size, field_size, embedding_size=8, optimizer_type='gd', learning_rate=1e-2, verbose=False,
+                 random_seed=None, eval_metric=roc_auc_score, greater_is_better=True, epoch=10, batch_size=1024, l2_reg=0, 
+                 deep_layers=[32, 32], batch_norm=True, dropout_deep=[]):
+        Model.__init__(self, eval_metric, greater_is_better, epoch, batch_size, verbose, batch_norm, dropout_deep)
+        init_vars = [('weight', [feature_size, 1], 'uniform', tf.float32),
+                     ('bias', [1], 'uniform', tf.float32),
+                     ('feature_embed', [feature_size, embedding_size], 'normal', tf.float32)]
+        num_pairs = int(field_size * (field_size - 1) / 2)
+        node_in = embedding_size * field_size + num_pairs
+        for i in range(len(deep_layers)):
+            init_vars.extend([('layer_%d' % i, [node_in, deep_layers[i]], 'glorot_normal', tf.float32)])
+            init_vars.extend([('bias_%d' % i, [1, deep_layers[i]], 'glorot_normal', tf.float32)])
+            node_in = deep_layers[i]
+
+        init_vars.extend([('concat_projection', [deep_layers[-1], 1], 'glorot_normal', tf.float32)])
+        init_vars.extend([('concat_bias', [1, 1], 'glorot_normal', tf.float32)])
+        self.graph = tf.Graph()
+        with self.graph.as_default():
+            if random_seed is not None:
+                tf.set_random_seed(random_seed)
+            
+            self.feat_index = tf.placeholder(tf.int32, shape=[None, None],
+                                                 name="feat_index")  # None * F
+            self.feat_value = tf.placeholder(tf.float32, shape=[None, None],
+                                                 name="feat_value")  # None * F
+            self.label = tf.placeholder(tf.float32, shape=[None, 1], name="label")  # None * 1
+            self.dropout_keep_deep = tf.placeholder(tf.float32, shape=[None], name="dropout_keep_deep")
+            self.train_phase = tf.placeholder(tf.bool, name="train_phase")
+            
+            self.vars = utils.init_var_map(init_vars)
+
+            self.embeddings = tf.nn.embedding_lookup(self.vars["feature_embed"],
+                                                             self.feat_index)  # None * F * K
+            feat_value = tf.reshape(self.feat_value, shape=[-1, field_size, 1]) 
+            self.embeddings = tf.multiply(self.embeddings, feat_value)
+
+            # ---------- Product component --------
+            self.xw = tf.reshape(self.embeddings, shape=[-1, field_size * embedding_size])
+            #self.xw = tf.nn.dropout(self.xw, self.dropout_keep_pnn[0])
+
+            row = []
+            col = []
+            for i in range(field_size - 1): 
+                for j in range(i+1, field_size):
+                    row.append(i)
+                    col.append(j)
+            p = tf.transpose(tf.gather(tf.transpose(self.embeddings, [1, 0, 2]), row), [1, 0, 2]) 
+            q = tf.transpose(tf.gather(tf.transpose(self.embeddings, [1, 0, 2]), col), [1, 0, 2]) 
+    
+            p = tf.reshape(p, [-1, num_pairs, embedding_size])
+            q = tf.reshape(q, [-1, num_pairs, embedding_size])
+            self.ip = tf.reshape(tf.reduce_sum(p * q, [-1]), [-1, num_pairs])
+            self.product_output = tf.concat([self.xw, self.ip], 1)
+            #self.product_output = tf.nn.dropout(self.product_output, self.dropout_keep_pnn[1]) 
+            # ---------- deep component --------
+            self.deep_input_size = num_pairs + field_size * embedding_size 
+            self.y_deep = tf.reshape(self.product_output, [-1, self.deep_input_size])
+            self.y_deep = tf.nn.dropout(self.y_deep, self.dropout_keep_deep[0])
+            for i in range(len(deep_layers)):
+                self.y_deep = tf.add(
+                    tf.matmul(self.y_deep, self.vars['layer_%s' % i]), self.vars['bias_%s' % i])
+                if self.batch_norm:
+                    self.y_deep = self.batch_norm_layer(self.y_deep, train_phase=self.train_phase, scope_bn="bn_%s" % i)
+                self.y_deep = tf.nn.dropout(utils.activate(self.y_deep, 'relu'), self.dropout_keep_deep[i+1])
+
+            concat_projection = self.vars['concat_projection']
+            concat_bias = self.vars['concat_bias'] 
+
+            self.out = tf.add(tf.matmul(self.y_deep, concat_projection), concat_bias)
+            self.y_prob = tf.sigmoid(self.out)
+            
+            self.loss = tf.reduce_mean(
+                tf.nn.sigmoid_cross_entropy_with_logits(labels=self.label, logits=self.out)) + \
+                    tf.contrib.layers.l2_regularizer(
+                        l2_reg)(self.vars["concat_projection"])
+            for i in range(len(deep_layers)):
+                self.loss += tf.contrib.layers.l2_regularizer(
+                    l2_reg)(self.vars["layer_%d"%i])
+
+            self.optimizer = utils.get_optimizer(optimizer_type, learning_rate, self.loss)
+            config = tf.ConfigProto()
+            config.gpu_options.allow_growth = True
+            self.sess = tf.Session(config=config)
+            self.sess.run(tf.global_variables_initializer())
+
