@@ -4,7 +4,7 @@ import pandas as pd
 import tensorflow as tf
 from sklearn.metrics import make_scorer
 
-from models import LR, FM, DeepFM, PNN
+from models import LR, FM, DeepFM, PNN, DCN
 from utils import read_data
 
 
@@ -81,4 +81,20 @@ elif algo == 'pnn':
     }
     pnn = PNN(**pnn_params)
     pnn.fit(Xi_train, Xv_train, y_train, Xi_valid, Xv_valid, y_valid)
-
+elif algo == 'dcn':
+    pnn_params = { 
+        "feature_size": feature_size,
+        "field_size": field_size,
+        "embedding_size": 15, 
+        "deep_layers": [256, 128, 64],
+        "epoch": 20, 
+        "batch_size": 1024,
+        "learning_rate": 0.001,
+        "optimizer_type": "adam",
+        "l2_reg": 0.01,
+        "dropout_deep": [0.5, 0.5, 0.5, 0.5],
+        "cross_layer_num": 3,
+        "verbose": True
+    }   
+    dcn = DCN(**pnn_params)
+    dcn.fit(Xi_train, Xv_train, y_train, Xi_valid, Xv_valid, y_valid)
