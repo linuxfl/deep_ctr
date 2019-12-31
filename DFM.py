@@ -69,9 +69,10 @@ class DFM:
 
             self.loss = tf.reduce_mean(
                 self.nll,
-                axis=1
+                axis=0
             )
 
+            self.a = tf.contrib.layers.l2_regularizer(self.lr_l2_reg)(self.wc)
             self.loss += tf.contrib.layers.l2_regularizer(self.lr_l2_reg)(self.wc)
             self.loss += tf.contrib.layers.l2_regularizer(self.dm_l2_reg)(self.wd)
 
@@ -125,7 +126,7 @@ class DFM:
                      self.fea_value: Xv,
                      self.label: y,
                      self.delay_time: dt}
-        loss, opt, p, l, nill = self.sess.run((self.loss, self.optimizer, self.p_x, self.lamb_x, self.nll), feed_dict=feed_dict)
+        loss, opt, p, l, nill, a = self.sess.run((self.loss, self.optimizer, self.p_x, self.lamb_x, self.nll, self.a), feed_dict=feed_dict)
         #print "label=%s\n, dt=%s\n, p_x=%s\n, lamb_x=%s\n, nill=%s\n" % (y, dt, p, l, nill)   
         return loss
 
@@ -139,7 +140,8 @@ class DFM:
             total_batch = int(len(y_train) / self.batch_size)
             for i in range(total_batch):
                 Xi_batch, Xv_batch, y_batch, y_dt_batch = self.get_batch(Xi_train, Xv_train, y_train, y_dt, self.batch_size, i)
-                #print "train loss: %s " % self.fit_on_batch(Xi_batch, Xv_batch, y_batch, y_dt_batch)
+                self.fit_on_batch(Xi_batch, Xv_batch, y_batch, y_dt_batch)
+                #print ("train loss: %s " % self.fit_on_batch(Xi_batch, Xv_batch, y_batch, y_dt_batch))
 
             # evaluate training and validation datasets
             train_result = self.evaluate(Xi_train, Xv_train, y_train)

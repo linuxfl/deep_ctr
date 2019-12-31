@@ -59,9 +59,9 @@ lr_params = {
     "feature_size": feature_size,
     "field_size": field_size,
     "epoch": 10,
-    "batch_size": 8,
+    "batch_size": 1024,
     "learning_rate": 0.001,
-    "optimizer_type": "gd"
+    "optimizer_type": "adam"
 }
 dfm = DFM(**lr_params)
 dfm.fit(Xi_train, Xv_train, y_train, y_tr_dt, Xi_valid, Xv_valid, y_valid)
